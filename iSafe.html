@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>iSafe</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    background: #111;
+    color: #eee;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+  }
+  h1 { font-size: 1.3rem; margin-bottom: 4px; }
+  p.sub { color: #aaa; margin-top: 0; }
+  .stage {
+    position: relative;
+    width: 640px;
+    max-width: 95vw;
+  }
+  video, canvas {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%;
+    border-radius: 0;
+  }
+  video { transform: scaleX(-1); }
+  canvas { transform: scaleX(-1); }
+  .controls {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .mode-row {
+    margin-top: 16px;
+    width: 640px;
+    max-width: 95vw;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .mode-row .controls {
+    margin-top: 0;
+  }
+  .calibrate-row {
+    margin-top: 16px;
+  }
+  input[type=number] {
+    width: 70px;
+    padding: 6px;
+    border-radius: 0;
+    border: 1px solid #444;
+    background: #222;
+    color: #eee;
+  }
+  button {
+    padding: 8px 16px;
+    border-radius: 0;
+    border: none;
+    background: #4f7cff;
+    color: white;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .readout {
+    margin-top: 18px;
+    font-size: 2.2rem;
+    font-weight: 700;
+  }
+  .status { color: #9a9; font-size: 0.9rem; min-height: 1.2em; }
+  .warning {
+    margin-top: 6px;
+    font-weight: 600;
+    min-height: 1.4em;
+  }
+  .warning.tooClose { color: #ff5c5c; }
+  .warning.ok { color: #7cd992; }
+  .modeBtn { background: #333; }
+  .modeBtn.active { background: #4f7cff; }
+  .placeholder-box {
+    width: 640px;
+    max-width: 95vw;
+    aspect-ratio: 4/3;
+    background: #000;
+    border-radius: 0;
+  }
+</style>
+</head>
+<body>
+
+<h1>iSafe</h1>
+
+<div class="stage">
+  <div class="placeholder-box"></div>
+  <video id="video" autoplay muted playsinline></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div class="mode-row">
+  <div class="controls">
+    <button id="adultBtn" class="modeBtn active">Adult</button>
+    <button id="kidBtn" class="modeBtn">Kid</button>
+  </div>
+
+  <div class="controls">
+    <button id="laptopBtn" class="modeBtn active">Laptop</button>
+    <button id="phoneBtn" class="modeBtn">Phone</button>
+  </div>
+</div>
+
+<div class="readout" id="distanceReadout">? cm</div>
+<div class="status" id="status">Loading...</div>
+<div class="warning" id="warning"></div>
+
+<div class="controls calibrate-row">
+  <label>Distance from camera (cm): <input id="knownDist" type="number" value="50" /></label>
+  <button id="calibrateBtn">Set distance</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+
+<script>
+const videoEl = document.getElementById('video');
+const canvasEl = document.getElementById('overlay');
+const ctx = canvasEl.getContext('2d');
+const statusEl = document.getElementById('status');
+const warningEl = document.getElementById('warning');
+const distanceReadout = document.getElementById('distanceReadout');
+const calibrateBtn = document.getElementById('calibrateBtn');
+const knownDistInput = document.getElementById('knownDist');
+
+const EYE_DISTANCE_PRESETS = {
+  adult: 63,
+  kid: 55
+};
+let REAL_EYE_DISTANCE_MM = EYE_DISTANCE_PRESETS.adult;
+
+const DEVICE_PRESETS = {
+  laptop: { fovDeg: 65, minDistanceCm: 35 },
+  phone:  { fovDeg: 70, minDistanceCm: 20 }
+};
+let currentDevice = 'laptop';
+
+let focalLengthPx = null;
+let isCalibrated = false;
+let currentPixelEyeDist = null;
+
+const TOO_CLOSE_HOLD_MS = 1000;
+const SAFE_HOLD_MS = 1000;
+let tooCloseSince = null;
+let safeSince = null;
+let canBeep = true;
+
+let audioCtx = null;
+function playAlert() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioCtx.state === "suspended") {
+    audioCtx.resume();
+  }
+  const startTime = audioCtx.currentTime;
+  const pulseCount = 3;
+  const pulseDuration = 0.12;
+  const gapDuration = 0.08;
+
+  for (let i = 0; i < pulseCount; i++) {
+    const t = startTime + i * (pulseDuration + gapDuration);
+    const oscillator = audioCtx.createOscillator();
+    const gainNode = audioCtx.createGain();
+    oscillator.connect(gainNode);
+    gainNode.connect(audioCtx.destination);
+    oscillator.type = "square";
+    oscillator.frequency.value = 1000;
+    gainNode.gain.setValueAtTime(0.0001, t);
+    gainNode.gain.exponentialRampToValueAtTime(0.25, t + 0.01);
+    gainNode.gain.exponentialRampToValueAtTime(0.0001, t + pulseDuration);
+    oscillator.start(t);
+    oscillator.stop(t + pulseDuration + 0.02);
+  }
+}
+
+function estimateFocalLength(frameWidthPx) {
+  const fovDeg = DEVICE_PRESETS[currentDevice].fovDeg;
+  const fovRad = fovDeg * Math.PI / 180;
+  return (frameWidthPx / 2) / Math.tan(fovRad / 2);
+}
+
+const LEFT_IRIS_CENTER = 468;
+const RIGHT_IRIS_CENTER = 473;
+
+function onResults(results) {
+  canvasEl.width = videoEl.videoWidth;
+  canvasEl.height = videoEl.videoHeight;
+  ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+
+  if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
+    statusEl.textContent = "Error: No face detected.";
+    warningEl.textContent = "";
+    warningEl.className = "warning";
+    currentPixelEyeDist = null;
+    tooCloseSince = null;
+    safeSince = null;
+    return;
+  }
+
+  const landmarks = results.multiFaceLandmarks[0];
+  const left = landmarks[LEFT_IRIS_CENTER];
+  const right = landmarks[RIGHT_IRIS_CENTER];
+
+  const x1 = left.x * canvasEl.width;
+  const y1 = left.y * canvasEl.height;
+  const x2 = right.x * canvasEl.width;
+  const y2 = right.y * canvasEl.height;
+
+  currentPixelEyeDist = Math.hypot(x2 - x1, y2 - y1);
+
+  ctx.fillStyle = "#4f7cff";
+  [ [x1,y1], [x2,y2] ].forEach(([x,y]) => {
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.strokeStyle = "#4f7cff";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+
+  if (focalLengthPx === null) {
+    focalLengthPx = estimateFocalLength(canvasEl.width);
+  }
+
+  const distanceMm = (REAL_EYE_DISTANCE_MM * focalLengthPx) / currentPixelEyeDist;
+  const distanceCm = distanceMm / 10;
+  distanceReadout.textContent = distanceCm.toFixed(1) + " cm";
+
+  const minDistanceCm = DEVICE_PRESETS[currentDevice].minDistanceCm;
+  const now = performance.now();
+
+  if (distanceCm < minDistanceCm) {
+    warningEl.textContent = "You are too close!";
+    warningEl.className = "warning tooClose";
+
+    safeSince = null;
+    if (tooCloseSince === null) {
+      tooCloseSince = now;
+    } else if (canBeep && (now - tooCloseSince >= TOO_CLOSE_HOLD_MS)) {
+      playAlert();
+      canBeep = false;
+    }
+  } else {
+    warningEl.textContent = "Keep doing what you're doing...";
+    warningEl.className = "warning ok";
+
+    tooCloseSince = null;
+    if (safeSince === null) {
+      safeSince = now;
+    } else if (!canBeep && (now - safeSince >= SAFE_HOLD_MS)) {
+      canBeep = true;
+    }
+  }
+}
+
+const faceMesh = new FaceMesh({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+});
+faceMesh.setOptions({
+  maxNumFaces: 1,
+  refineLandmarks: true,
+  minDetectionConfidence: 0.5,
+  minTrackingConfidence: 0.5
+});
+faceMesh.onResults(onResults);
+
+const CAPTURE_INTERVAL_MS = 300; 
+let detectionTimer = null;
+
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480 }
+    });
+    videoEl.srcObject = stream;
+    await videoEl.play();
+    statusEl.textContent = "Loading...";
+    if (!detectionTimer) {
+      detectionTimer = setInterval(() => {
+        if (videoEl.readyState >= 2) {
+          faceMesh.send({ image: videoEl });
+        }
+      }, CAPTURE_INTERVAL_MS);
+    }
+  } catch (err) {
+    statusEl.textContent = "Error: Camera.";
+  }
+}
+
+startCamera();
+
+const adultBtn = document.getElementById('adultBtn');
+const kidBtn = document.getElementById('kidBtn');
+
+function setMode(mode) {
+  REAL_EYE_DISTANCE_MM = EYE_DISTANCE_PRESETS[mode];
+  adultBtn.classList.toggle('active', mode === 'adult');
+  kidBtn.classList.toggle('active', mode === 'kid');
+
+  focalLengthPx = null;
+  isCalibrated = false;
+}
+
+adultBtn.addEventListener('click', () => setMode('adult'));
+kidBtn.addEventListener('click', () => setMode('kid'));
+
+const laptopBtn = document.getElementById('laptopBtn');
+const phoneBtn = document.getElementById('phoneBtn');
+
+function setDevice(device) {
+  currentDevice = device;
+  laptopBtn.classList.toggle('active', device === 'laptop');
+  phoneBtn.classList.toggle('active', device === 'phone');
+
+  focalLengthPx = null;
+  isCalibrated = false;
+}
+
+laptopBtn.addEventListener('click', () => setDevice('laptop'));
+phoneBtn.addEventListener('click', () => setDevice('phone'));
+
+calibrateBtn.addEventListener('click', () => {
+  if (currentPixelEyeDist === null) {
+    statusEl.textContent = "Can't calibrate — no face detected right now.";
+    return;
+  }
+  const knownDistCm = parseFloat(knownDistInput.value);
+  if (!knownDistCm || knownDistCm <= 0) {
+    statusEl.textContent = "Enter a valid known distance first.";
+    return;
+  }
+  const knownDistMm = knownDistCm * 10;
+  focalLengthPx = (currentPixelEyeDist * knownDistMm) / REAL_EYE_DISTANCE_MM;
+  isCalibrated = true;
+});
+</script>
+
+</body>
+</html>
